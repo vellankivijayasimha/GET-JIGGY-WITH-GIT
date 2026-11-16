@@ -1,0 +1,122 @@
+NAME        : chk_new_loop_c_ind
+PERIODICITY : 5
+PRIORITY    : 200
+TYPE        : INDEPENDENT
+
+START
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "scadaapi.h"
+#include "dbms.h"
+
+/* 
+ * Generated schema header for EMAP (Database 91).
+ * If object_91.h is available in %OSI%/src/include, include it for EMAP_DEVICE_STR.
+ */
+#ifdef HAS_OBJECT_91_H
+#include "object_91.h"
+#else
+/* Standard monarch database numbers if not using object_91.h */
+#define EMAP_Dbno       91
+#define O_EMAP_DEVICE   7
+
+/* Minimal layout matching EMAP_DEVICE for LoopNumber and LoopGroup */
+typedef struct {
+    OSI_BYTE   Indic;
+    OSI_BYTE   Validity;
+    /* Device fields preceding LoopNumber in your schema */
+    OSI_INT32  LoopGroup;
+    OSI_INT32  LoopNumber;
+} EMAP_DEVICE_STR;
+#endif
+
+/* Target SCADA C_IND Key */
+#define TARGET_C_IND_KEY    "01002001"
+
+/* Desired states for 01002001 */
+#define C_IND_NORMAL        0
+#define C_IND_LOOP_CREATED  1
+
+/* State tracking */
+static OSI_INT16 s_emap_db_opened = 0;
+static OSI_INT32 s_highest_loop_seen = 0;
+static OSI_INT16 s_initialized = 0;
+
+void check_for_new_loop_creation(void);
+
+MAIN
+{
+    check_for_new_loop_creation();
+}
+
+void check_for_new_loop_creation(void)
+{
+    OSI_RECORD num_records = 0;
+    OSI_RECORD rec_idx = 0;
+    OSI_INT32  max_loop_this_cycle = 0;
+    SCADA_POINT_HANDLE scada_rec = 0;
+
+    /* 1. Initialize DBMS subsystem once */
+    if (!s_emap_db_opened) {
+        if (DBMS_init("chk_new_loop_c_ind") != OSI_SUCCESS) {
+            printf("[chk_new_loop_c_ind] Failed to initialize DBMS.\n");
+            return;
+        }
+
+        /* Open Database 91 (EMAP) in read-only mode */
+        if (DBMS_open(EMAP_Dbno, READ_NO_LOCK, 0) != OSI_SUCCESS) {
+            printf("[chk_new_loop_c_ind] Failed to open EMAP database %d.\n", EMAP_Dbno);
+            return;
+        }
+        s_emap_db_opened = 1;
+    }
+
+    /* 2. Validate SCADA Status key exists */
+    if (SCADAGetRecord(TARGET_C_IND_KEY, SCADA_STATUS, &scada_rec) != RTN_OK) {
+        printf("[chk_new_loop_c_ind] Invalid SCADA Status key: %s\n", TARGET_C_IND_KEY);
+        return;
+    }
+
+    /* 3. Get total device records in EMAP_DEVICE */
+    num_records = DBMS_get_num_records(EMAP_Dbno, O_EMAP_DEVICE);
+    if (num_records <= 0) {
+        return;
+    }
+
+    /* 4. Scan devices to find highest LoopNumber */
+    for (rec_idx = 1; rec_idx <= num_records; rec_idx++) {
+        EMAP_DEVICE_STR *dev = (EMAP_DEVICE_STR *)DBMS_get_object(EMAP_Dbno, O_EMAP_DEVICE, rec_idx);
+        if (dev == NULL) {
+            continue;
+        }
+
+        /* 
+         * Exclude normal loops (LoopGroup > 0) if you only want to alarm
+         * on abnormal loops, or check dev->LoopNumber > 0 for any loop.
+         */
+        if (dev->LoopNumber > max_loop_this_cycle) {
+            max_loop_this_cycle = dev->LoopNumber;
+        }
+    }
+
+    /* 5. First-cycle baseline initialization */
+    if (!s_initialized) {
+        s_highest_loop_seen = max_loop_this_cycle;
+        s_initialized = 1;
+        printf("[chk_new_loop_c_ind] Initialized baseline highest LoopNumber = %d\n", s_highest_loop_seen);
+        return;
+    }
+
+    /* 6. Detect creation of a new LoopNumber */
+    if (max_loop_this_cycle > s_highest_loop_seen) {
+        printf("[chk_new_loop_c_ind] New LoopNumber %d created! Updating %s -> %d\n",
+               max_loop_this_cycle, TARGET_C_IND_KEY, C_IND_LOOP_CREATED);
+
+        PUT_STATUS(TARGET_C_IND_KEY, (OSI_BYTE)C_IND_LOOP_CREATED);
+        s_highest_loop_seen = max_loop_this_cycle;
+    }
+}
+
+END
